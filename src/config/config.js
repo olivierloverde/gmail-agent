@@ -22,11 +22,22 @@ const config = {
   summary: {
     maxEmailsInSummary: 500,
   },
+  web: {
+    enabled: process.env.ENABLE_WEB_INTERFACE === "true",
+    port: process.env.WEB_PORT || 3001,
+  },
+  jwt: {
+    secret: process.env.JWT_SECRET || "default_secret_change_this",
+  },
 };
 
 // Validate required configuration
 if (!config.gmail.credentials) {
   console.error("Gmail credentials path is not set in environment variables");
+}
+
+if (config.web.enabled && !config.jwt.secret) {
+  console.error("JWT secret is required when web interface is enabled");
 }
 
 module.exports = config;
