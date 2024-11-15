@@ -5,13 +5,14 @@ const setup = require("./utils/setup");
 const fs = require("fs");
 
 // Move service requires inside functions to prevent early initialization
-let emailService, aiService, telegramService;
+let emailService, aiService, telegramService, webService;
 
 async function loadServices() {
   try {
     emailService = require("./services/emailService");
     aiService = require("./services/aiService");
     telegramService = require("./services/telegramService");
+    webService = require("./services/webService");
     logger.info("Services loaded successfully");
   } catch (error) {
     logger.error("Error loading services", { error: error.message });
@@ -146,6 +147,12 @@ async function main() {
     // Load services after config is ready
     await loadServices();
 
+    // Initialize web service
+    if (process.env.ENABLE_WEB_INTERFACE === "true") {
+      await webService.initialize();
+      logger.info("Web service initialized");
+    }
+
     // Start the email processing
     logger.info("Starting email processing service");
 
@@ -170,6 +177,7 @@ async function main() {
       process.exit(0);
     });
   } catch (error) {
+    logger.error(error);
     logger.error("Failed to start service", {
       error: error.message,
       stack: error.stack,
@@ -180,6 +188,7 @@ async function main() {
 
 // Add global error handlers
 process.on("uncaughtException", (error) => {
+  logger.error(error);
   logger.error("Uncaught Exception:", {
     error: error.message,
     stack: error.stack,
