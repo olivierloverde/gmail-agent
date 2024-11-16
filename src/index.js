@@ -5,13 +5,22 @@ const setup = require("./utils/setup");
 const fs = require("fs");
 
 // Move service requires inside functions to prevent early initialization
-let emailService, aiService, telegramService;
+let emailService, aiService, telegramService, taskService, dbService;
 
 async function loadServices() {
   try {
     emailService = require("./services/emailService");
     aiService = require("./services/aiService");
     telegramService = require("./services/telegramService");
+    taskService = require("./services/taskService");
+    dbService = require("./services/dbService");
+
+    // Initialize database service first
+    await dbService.initialize();
+
+    // Set up the connection between services
+    dbService.setTaskService(taskService);
+
     logger.info("Services loaded successfully");
   } catch (error) {
     logger.error("Error loading services", { error: error.message });
@@ -69,7 +78,6 @@ async function processEmail(email) {
     await waitForUserResponse();
     logger.info(`User responded to email ${email.id}`);
   } catch (error) {
-    logger.error(error);
     logger.error(`Error processing email ${email.id}`, {
       error: error.message,
       stack: error.stack,
@@ -77,10 +85,13 @@ async function processEmail(email) {
   }
 }
 
-async function processEmails() {
+let isProcessingEmails = false;
+
+// Add this function for initial task extraction
+async function extractTasksFromEmails() {
   try {
-    // Initialize services
-    logger.info("Initializing services...");
+    // Initialize services first
+    logger.info("Initializing services for task extraction...");
 
     try {
       await emailService.initialize();
@@ -102,27 +113,128 @@ async function processEmails() {
       throw error;
     }
 
-    // Fetch unread emails
+    logger.info("Starting task extraction process...");
     const emails = await emailService.fetchUnreadEmails();
-    logger.info(`Found ${emails.length} unread emails`);
+    logger.info(`Found ${emails.length} unread emails for task extraction`);
 
-    // Process each email that hasn't been processed yet
-    for (const email of emails) {
-      if (!emailService.processedEmails.has(email.id)) {
-        await processEmail(email);
-      } else {
-        logger.info(`Skipping already processed email ${email.id}`);
+    const taskExtractionResults = [];
+    const autoArchiveEmails = new Set();
+
+    // Process emails in parallel batches
+    const BATCH_SIZE = 10; // Process 10 emails at a time
+
+    for (let i = 0; i < emails.length; i += BATCH_SIZE) {
+      const batch = emails.slice(i, i + BATCH_SIZE);
+
+      const batchResults = await Promise.all(
+        batch.map(async (email) => {
+          if (!emailService.processedEmails.has(email.id)) {
+            try {
+              const quickAnalysis = await aiService.quickAnalyzeEmail(email);
+
+              if (quickAnalysis.shouldAutoArchive) {
+                autoArchiveEmails.add(email.id);
+                logger.info(
+                  `Email ${email.id} marked for auto-archiving: ${quickAnalysis.reason}`
+                );
+                return null;
+              } else {
+                logger.info(`Analyzing email ${email.id} for tasks`);
+                const tasks = await taskService.extractTasksFromEmail(email);
+                if (tasks && tasks.length > 0) {
+                  return { email, tasks };
+                }
+              }
+            } catch (taskError) {
+              logger.error(`Error in task analysis for email ${email.id}`, {
+                error: taskError.message,
+              });
+            }
+          }
+          return null;
+        })
+      );
+
+      // Add successful results to taskExtractionResults
+      taskExtractionResults.push(
+        ...batchResults.filter((result) => result !== null)
+      );
+    }
+
+    // Process extracted tasks if any
+    if (taskExtractionResults.length > 0) {
+      try {
+        logger.info(
+          `Optimizing ${taskExtractionResults.length} task groups...`
+        );
+        await taskService.optimizeTaskList(taskExtractionResults);
+        await telegramService.notifyTaskSummary(taskExtractionResults);
+      } catch (optimizeError) {
+        logger.error("Error optimizing task list", {
+          error: optimizeError.message,
+        });
       }
     }
 
-    logger.info("Finished processing all emails");
+    // Auto-archive emails in parallel
+    if (autoArchiveEmails.size > 0) {
+      await Promise.all(
+        Array.from(autoArchiveEmails).map((emailId) =>
+          emailService
+            .archiveEmail(emailId)
+            .then(() => logger.info(`Auto-archived email ${emailId}`))
+            .catch((error) =>
+              logger.error(`Error auto-archiving email ${emailId}`, { error })
+            )
+        )
+      );
+    }
+
+    return { taskExtractionResults, autoArchiveEmails };
+  } catch (error) {
+    logger.error("Error in task extraction process", {
+      error: error.message,
+      stack: error.stack,
+    });
+    return { taskExtractionResults: [], autoArchiveEmails: new Set() };
+  }
+}
+
+// Update the processEmails function
+async function processEmails(startProcessing = false) {
+  try {
+    logger.info("Processing emails");
+    if (startProcessing) {
+      // Fetch unread emails
+      const emails = await emailService.fetchUnreadEmails();
+      logger.info(`Found ${emails.length} unread emails`);
+
+      // Filter out emails that have been auto-archived or already processed
+      const unprocessedEmails = emails.filter(
+        (email) => !emailService.processedEmails.has(email.id)
+      );
+
+      if (unprocessedEmails.length > 0) {
+        // Process one email at a time
+        for (const email of unprocessedEmails) {
+          await processEmail(email);
+          // Wait a bit between emails to avoid overwhelming the user
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+      } else {
+        await telegramService.bot.sendMessage(
+          config.telegram.userId,
+          "📧 No emails to process at this time."
+        );
+      }
+      logger.info("Finished processing emails");
+    }
   } catch (error) {
     logger.error("Error in email processing cycle", {
       error: error.message,
       stack: error.stack,
     });
 
-    // If initialization failed, exit the process
     if (error.message.includes("Failed to initialize")) {
       logger.error("Critical initialization error, exiting...");
       throw error;
@@ -130,6 +242,23 @@ async function processEmails() {
   }
 }
 
+// Update the startEmailProcessing function
+module.exports = {
+  startEmailProcessing: async () => {
+    if (!isProcessingEmails) {
+      isProcessingEmails = true;
+      await processEmails(true);
+      isProcessingEmails = false; // Reset flag when done
+    }
+  },
+  stopEmailProcessing: () => {
+    isProcessingEmails = false;
+  },
+  isProcessingEmails: () => isProcessingEmails,
+  processEmails: () => processEmails(false), // For initial task extraction only
+};
+
+// Update the main function
 async function main() {
   try {
     // Ensure required directories exist
@@ -146,29 +275,15 @@ async function main() {
     // Load services after config is ready
     await loadServices();
 
-    // Start the email processing
-    logger.info("Starting email processing service");
+    // Start with initial task extraction
+    await extractTasksFromEmails();
 
-    // Run initial process
-    await processEmails();
-
-    // Set up interval for future checks
+    // Set up interval for future task extractions
     setInterval(async () => {
-      // Only start new processing if there are no pending confirmations
-      if (
-        !telegramService.pendingConfirmations.has(
-          parseInt(config.telegram.userId)
-        )
-      ) {
-        await processEmails();
+      if (!isProcessingEmails) {
+        await extractTasksFromEmails();
       }
     }, 5 * 60 * 1000);
-
-    // Handle process termination
-    process.on("SIGINT", () => {
-      logger.info("Service shutting down");
-      process.exit(0);
-    });
   } catch (error) {
     logger.error("Failed to start service", {
       error: error.message,
@@ -193,6 +308,23 @@ process.on("unhandledRejection", (reason, promise) => {
     stack: reason?.stack,
   });
   process.exit(1);
+});
+
+// Update the existing process handlers
+process.on("SIGINT", async () => {
+  const telegramService = require("./services/telegramService");
+  const dbService = require("./services/dbService");
+  await telegramService.cleanup();
+  await dbService.cleanup();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  const telegramService = require("./services/telegramService");
+  const dbService = require("./services/dbService");
+  await telegramService.cleanup();
+  await dbService.cleanup();
+  process.exit(0);
 });
 
 main();

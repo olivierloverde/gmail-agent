@@ -33,6 +33,9 @@ class Logger {
   }
 
   error(message, data) {
+    if (data) {
+      console.error(data);
+    }
     this.log("ERROR", message, data);
   }
 

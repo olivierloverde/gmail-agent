@@ -531,6 +531,502 @@ Provide only the refined response without any additional commentary.`
       };
     }
   }
+
+  generateTaskId(task) {
+    // Create a normalized string from core task attributes
+    const normalizedDescription = task.description
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, " ");
+
+    const components = [
+      task.threadId || "",
+      normalizedDescription,
+      task.deadline || "",
+      task.priority || "",
+    ];
+
+    // Create a hash of the components
+    const crypto = require("crypto");
+    const hash = crypto
+      .createHash("sha256")
+      .update(components.join("::"))
+      .digest("hex");
+
+    // Return a shorter, but still unique ID
+    return `task_${hash.substring(0, 12)}`;
+  }
+
+  async analyzeTasksInEmail(email) {
+    try {
+      const userData = await userService.getUserData();
+      const relevantContext = await contextService.getRelevantContext(email);
+
+      const prompt = new PromptTemplate({
+        template: `As an AI assistant for {firstName} {lastName}, analyze this email for actionable tasks.
+
+Available Context:
+{context}
+
+Email Details:
+Subject: {subject}
+From: {from}
+Content: {body}
+
+Extract tasks following these rules:
+1. Only include clear, actionable items
+2. Use the available context to:
+   - Determine task priority based on user's preferences
+   - Identify related tasks or dependencies
+   - Set appropriate deadlines based on context
+3. Determine priority based on:
+   - HIGH: Urgent or time-sensitive items
+   - MEDIUM: Important but not urgent
+   - LOW: Nice to have or can be delayed
+4. Extract any dependencies or prerequisites
+
+Return tasks in this EXACT format (no extra spaces or characters):
+[{{"description":"task description","deadline":null,"priority":"HIGH/MEDIUM/LOW","dependencies":[],"context":"relevant context from available information"}}]
+
+Important:
+- Use context to make tasks more specific and actionable
+- Reference relevant context in task descriptions
+- Consider user's preferences and past interactions
+- If no tasks found, return []
+- Use double quotes for JSON properties
+- No trailing commas
+- No extra whitespace`,
+        inputVariables: [
+          "firstName",
+          "lastName",
+          "context",
+          "subject",
+          "from",
+          "body",
+        ],
+      });
+
+      const formattedPrompt = await prompt.format({
+        firstName: userData.firstName,
+        lastName: userData.lastName || "",
+        context: JSON.stringify(relevantContext, null, 2),
+        subject: email.subject || "",
+        from: email.from || "",
+        body: email.body || "",
+      });
+
+      const response = await this.model.invoke(formattedPrompt);
+
+      try {
+        // Clean the response content
+        const cleanedContent = response.content
+          .trim()
+          .replace(/^```json\s*/g, "")
+          .replace(/\s*```$/g, "")
+          .trim();
+
+        let tasks;
+        try {
+          tasks = JSON.parse(cleanedContent);
+        } catch (jsonError) {
+          const fixedJson = cleanedContent
+            .replace(/\n/g, "")
+            .replace(/,\s*]/g, "]")
+            .replace(/,\s*}/g, "}");
+          tasks = JSON.parse(fixedJson);
+        }
+
+        if (!Array.isArray(tasks)) {
+          logger.warn("AI returned non-array response for tasks", {
+            emailId: email.id,
+            response: cleanedContent,
+          });
+          return [];
+        }
+
+        // Before returning the tasks, add context and generate IDs
+        const tasksWithContext = tasks.map((task) => ({
+          ...task,
+          id: this.generateTaskId({ ...task, threadId: email.threadId }),
+          threadId: email.threadId,
+          emailId: email.id,
+          from: email.from,
+          subject: email.subject,
+          context: {
+            emailSubject: email.subject,
+            emailFrom: email.from,
+            emailBody: email.body,
+            extractedAt: new Date().toISOString(),
+          },
+        }));
+
+        return tasksWithContext;
+      } catch (parseError) {
+        logger.error("Error parsing AI task response", {
+          error: parseError.message,
+          emailId: email.id,
+          response: response.content,
+        });
+        return [];
+      }
+    } catch (error) {
+      logger.error("Error analyzing tasks in email", {
+        error: error.message,
+        emailId: email.id,
+      });
+      return [];
+    }
+  }
+
+  extractRelevantContextForTask(task, allContext) {
+    const relevantContext = {};
+
+    // Extract context based on keywords in task description
+    const keywords = task.description.toLowerCase().split(/\W+/);
+
+    for (const category in allContext) {
+      const categoryContext = {};
+      for (const [key, value] of Object.entries(allContext[category])) {
+        if (
+          keywords.some(
+            (keyword) =>
+              key.toLowerCase().includes(keyword) ||
+              value.toString().toLowerCase().includes(keyword)
+          )
+        ) {
+          categoryContext[key] = value;
+        }
+      }
+      if (Object.keys(categoryContext).length > 0) {
+        relevantContext[category] = categoryContext;
+      }
+    }
+
+    return relevantContext;
+  }
+
+  async compareTaskSimilarity(task1Description, task2Description) {
+    try {
+      // Quick pre-check using string similarity
+      const quickSimilarity = this.quickStringComparison(
+        task1Description,
+        task2Description
+      );
+
+      if (quickSimilarity < 0.3) return 0;
+      if (quickSimilarity > 0.9) return 1;
+
+      // Include context in similarity comparison
+      const prompt = new PromptTemplate({
+        template: `Compare these tasks for similarity:
+
+Task 1: {task1}
+Task 2: {task2}
+
+Consider:
+1. Core objective similarity
+2. Required actions similarity
+3. Context and scope overlap
+4. Dependencies and relationships
+
+Return ONLY a number between 0 and 1, where:
+1.0 = identical tasks
+0.0 = completely different tasks
+>0.8 = very similar tasks
+>0.5 = somewhat related tasks
+<0.3 = different tasks`,
+        inputVariables: ["task1", "task2"],
+      });
+
+      const formattedPrompt = await prompt.format({
+        task1: task1Description || "",
+        task2: task2Description || "",
+      });
+
+      const response = await this.model.invoke(formattedPrompt);
+      const similarityScore = parseFloat(response.content.trim());
+
+      if (
+        isNaN(similarityScore) ||
+        similarityScore < 0 ||
+        similarityScore > 1
+      ) {
+        logger.warn("Invalid similarity score from AI", {
+          score: response.content,
+          task1: task1Description,
+          task2: task2Description,
+        });
+        return quickSimilarity;
+      }
+
+      return similarityScore;
+    } catch (error) {
+      logger.error("Error comparing task similarity", {
+        error: error.message,
+        task1Description,
+        task2Description,
+      });
+      // Return quick similarity as fallback
+      return this.quickStringComparison(
+        task1Description || "",
+        task2Description || ""
+      );
+    }
+  }
+
+  quickStringComparison(str1, str2) {
+    // Convert strings to lowercase and remove punctuation
+    const normalize = (str) => str.toLowerCase().replace(/[^\w\s]/g, "");
+    const s1 = normalize(str1);
+    const s2 = normalize(str2);
+
+    // Get word sets
+    const words1 = new Set(s1.split(/\s+/));
+    const words2 = new Set(s2.split(/\s+/));
+
+    // Calculate Jaccard similarity
+    const intersection = new Set([...words1].filter((x) => words2.has(x)));
+    const union = new Set([...words1, ...words2]);
+
+    return intersection.size / union.size;
+  }
+
+  async generateParentTaskDescription(taskGroup) {
+    try {
+      const prompt = new PromptTemplate({
+        template: `Create a parent task description that encompasses these related tasks:
+
+Tasks:
+{tasks}
+
+Guidelines:
+1. Create a clear, concise parent task description
+2. Capture the common objective
+3. Keep it actionable
+4. Include scope of subtasks
+5. Maintain context
+
+Return ONLY the parent task description in a single line.`,
+        inputVariables: ["tasks"],
+      });
+
+      const tasksText = taskGroup
+        .map((task, index) => `${index + 1}. ${task.description}`)
+        .join("\n");
+
+      const formattedPrompt = await prompt.format({
+        tasks: tasksText,
+      });
+
+      const response = await this.model.invoke(formattedPrompt);
+      return response.content.trim();
+    } catch (error) {
+      logger.error("Error generating parent task description", {
+        error: error.message,
+        taskCount: taskGroup?.length,
+      });
+      return `Combined task group (${taskGroup.length} tasks)`; // Fallback description
+    }
+  }
+
+  async quickAnalyzeEmail(email) {
+    try {
+      const prompt = new PromptTemplate({
+        template: `Quickly analyze if this email should be automatically archived without task extraction.
+
+Subject: {subject}
+From: {from}
+Content: {body}
+
+Auto-archive if ANY of these are true:
+1. Automated notification or alert
+2. Newsletter or marketing email
+3. System-generated message
+4. Service notification
+5. Delivery status/tracking update
+6. Calendar invitation/update
+7. Subscription confirmation
+8. Automated receipt/invoice
+9. Social media notification
+10. Promotional offer
+11. "no-reply" sender address
+12. Automated workflow email
+
+Return EXACTLY in this format:
+ARCHIVE: true/false
+REASON: [Brief reason if should be archived]`,
+        inputVariables: ["subject", "from", "body"],
+      });
+
+      const formattedPrompt = await prompt.format({
+        subject: email.subject || "",
+        from: email.from || "",
+        body: email.body || "",
+      });
+
+      const response = await this.model.invoke(formattedPrompt);
+      const lines = response.content.trim().split("\n");
+
+      try {
+        const shouldArchive =
+          lines[0].split(":")[1].trim().toLowerCase() === "true";
+        const reason = lines[1].split(":")[1].trim();
+
+        logger.info(`Quick analysis result for email ${email.id}:`, {
+          shouldArchive,
+          reason,
+        });
+
+        return {
+          shouldAutoArchive: shouldArchive,
+          reason: reason,
+        };
+      } catch (parseError) {
+        logger.error("Error parsing quick analysis response", {
+          error: parseError.message,
+          response: response.content,
+          emailId: email.id,
+        });
+        return {
+          shouldAutoArchive: false,
+          reason: "Error parsing analysis response",
+        };
+      }
+    } catch (error) {
+      logger.error("Error in quick email analysis", {
+        error: error.message,
+        emailId: email.id,
+      });
+      return {
+        shouldAutoArchive: false,
+        reason: "Error performing analysis",
+      };
+    }
+  }
+
+  async compareTaskSets({ existingTasks, newTasks, threadContext }) {
+    try {
+      const prompt = new PromptTemplate({
+        template: `Analyze these sets of tasks from the same email thread:
+
+Email Thread Context:
+Subject: {threadSubject}
+From: {threadFrom}
+Content: {threadContent}
+
+Existing Tasks:
+{existingTasksList}
+
+New Tasks:
+{newTasksList}
+
+For each new task, determine if it:
+1. Is completely new and should be created
+2. Updates/refines an existing task
+3. Is a duplicate and should be skipped
+
+Consider:
+- Tasks might be reworded versions of the same requirement
+- Some tasks might be more detailed versions of existing ones
+- Tasks might be split or combined differently
+- Context from the email thread
+
+Return your analysis in this EXACT format (no extra spaces or line breaks):
+{{"results": [
+  {{"task": {{"description": "task text", "priority": "priority", "deadline": "deadline"}}, "action": "CREATE/UPDATE/SKIP", "existingTaskId": "id if updating", "updatedTask": {{"description": "updated text", "priority": "priority", "deadline": "deadline"}}, "reason": "explanation"}}
+]}}`,
+        inputVariables: [
+          "threadSubject",
+          "threadFrom",
+          "threadContent",
+          "existingTasksList",
+          "newTasksList",
+        ],
+      });
+
+      const formattedPrompt = await prompt.format({
+        threadSubject: threadContext.subject || "",
+        threadFrom: threadContext.from || "",
+        threadContent: threadContext.body || "",
+        existingTasksList:
+          existingTasks
+            .map(
+              (task, i) =>
+                `${i + 1}. [ID: ${task.id}] ${task.description} (Priority: ${
+                  task.priority
+                }${task.deadline ? `, Due: ${task.deadline}` : ""})`
+            )
+            .join("\n") || "No existing tasks",
+        newTasksList: newTasks
+          .map(
+            (task, i) =>
+              `${i + 1}. ${task.description} (Priority: ${task.priority}${
+                task.deadline ? `, Due: ${task.deadline}` : ""
+              })`
+          )
+          .join("\n"),
+      });
+
+      const response = await this.model.invoke(formattedPrompt);
+
+      try {
+        const result = JSON.parse(response.content.trim());
+
+        // Preserve context and metadata when suggesting updates
+        result.results = result.results.map((result) => {
+          if (result.action === "UPDATE" && result.existingTaskId) {
+            const existingTask = existingTasks.find(
+              (t) => t.id === result.existingTaskId
+            );
+            if (existingTask) {
+              result.updatedTask = {
+                ...result.updatedTask,
+                emailId: existingTask.email_id,
+                threadId: existingTask.thread_id,
+                from: existingTask.from_address,
+                subject: existingTask.subject,
+                context: existingTask.context,
+              };
+            }
+          }
+          return result;
+        });
+
+        logger.info("Task comparison results", {
+          totalResults: result.results.length,
+          actions: result.results.map((r) => r.action),
+        });
+        return result.results;
+      } catch (parseError) {
+        logger.error("Error parsing AI comparison response", {
+          error: parseError.message,
+          response: response.content,
+        });
+        // If parsing fails, treat all tasks as new
+        return newTasks.map((task) => ({
+          task,
+          action: "CREATE",
+          existingTaskId: null,
+          updatedTask: null,
+          reason: "Error parsing AI response, creating as new task",
+        }));
+      }
+    } catch (error) {
+      logger.error("Error comparing task sets", {
+        error: error.message,
+        existingTaskCount: existingTasks.length,
+        newTaskCount: newTasks.length,
+      });
+      // On error, treat all tasks as new
+      return newTasks.map((task) => ({
+        task,
+        action: "CREATE",
+        existingTaskId: null,
+        updatedTask: null,
+        reason: "Error during comparison, creating as new task",
+      }));
+    }
+  }
 }
 
 module.exports = new AIService();
