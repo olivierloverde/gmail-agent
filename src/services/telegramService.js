@@ -5,21 +5,50 @@ const emailService = require("./emailService");
 const aiService = require("./aiService");
 const summaryService = require("./summaryService");
 const cron = require("node-cron");
+const taskService = require("./taskService");
 
 class TelegramService {
   constructor() {
     this.bot = null;
     this.pendingConfirmations = new Map();
     this.editingResponses = new Map();
+    this.isInitialized = false;
   }
 
   async initialize() {
     try {
+      if (this.isInitialized) {
+        logger.info("Telegram bot already initialized");
+        return;
+      }
+
+      if (this.bot) {
+        // Stop existing bot if any
+        await this.stopBot();
+      }
+
       this.bot = new TelegramBot(config.telegram.botToken, { polling: true });
 
       // Register command handlers
       this.bot.onText(/\/summary/, this.handleSummaryCommand.bind(this));
       this.bot.onText(/\/help/, this.handleHelpCommand.bind(this));
+      this.bot.onText(/\/tasks/, this.handleTasksCommand.bind(this));
+      this.bot.onText(
+        /\/task_done (.+)/,
+        this.handleTaskDoneCommand.bind(this)
+      );
+      this.bot.onText(
+        /\/start_processing/,
+        this.handleStartProcessing.bind(this)
+      );
+      this.bot.onText(
+        /\/stop_processing/,
+        this.handleStopProcessing.bind(this)
+      );
+      this.bot.onText(
+        /\/processing_status/,
+        this.handleProcessingStatus.bind(this)
+      );
 
       // Register callback query handler
       this.bot.on("callback_query", this.handleCallbackQuery.bind(this));
@@ -27,17 +56,133 @@ class TelegramService {
       // Register general message handler
       this.bot.on("message", this.handleIncomingMessage.bind(this));
 
-      // Schedule summaries at 9 AM, 2 PM, and 7 PM
-      cron.schedule("0 9,14,19 * * *", () => {
-        this.sendScheduledSummary();
+      // Handle polling errors
+      this.bot.on("polling_error", (error) => {
+        logger.error("Telegram polling error", { error: error.message });
+        if (error.message.includes("terminated by other getUpdates request")) {
+          this.handlePollingConflict();
+        }
       });
 
+      // Schedule summaries at 9 AM, 2 PM, and 7 PM
+      this.scheduleSummaries();
+
+      this.isInitialized = true;
       logger.info("Telegram bot initialized with scheduled summaries");
     } catch (error) {
       logger.error("Failed to initialize Telegram bot", {
         error: error.message,
       });
       throw error;
+    }
+  }
+
+  async stopBot() {
+    try {
+      if (this.bot) {
+        logger.info("Stopping Telegram bot...");
+        await this.bot.stopPolling();
+        this.bot = null;
+        this.isInitialized = false;
+        logger.info("Telegram bot stopped");
+      }
+    } catch (error) {
+      logger.error("Error stopping Telegram bot", { error: error.message });
+    }
+  }
+
+  async handlePollingConflict() {
+    try {
+      logger.info("Handling polling conflict...");
+      await this.stopBot();
+      await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait 1 second
+      await this.initialize();
+    } catch (error) {
+      logger.error("Error handling polling conflict", { error: error.message });
+    }
+  }
+
+  scheduleSummaries() {
+    if (this.scheduledSummaries) {
+      this.scheduledSummaries.forEach((schedule) => schedule.stop());
+    }
+
+    this.scheduledSummaries = [
+      cron.schedule("0 9,14,19 * * *", () => {
+        this.sendScheduledSummary();
+      }),
+    ];
+  }
+
+  // Add to class cleanup method
+  async cleanup() {
+    await this.stopBot();
+    if (this.scheduledSummaries) {
+      this.scheduledSummaries.forEach((schedule) => schedule.stop());
+    }
+  }
+
+  // Update the existing handleStartProcessing method
+  async handleStartProcessing(msg) {
+    try {
+      if (msg.from.id.toString() !== config.telegram.userId) {
+        logger.warn(
+          `Unauthorized start processing request from user ${msg.from.id}`
+        );
+        return;
+      }
+
+      const emailProcessor = require("../index");
+      if (!emailProcessor.isProcessingEmails()) {
+        // Reinitialize bot if needed
+        if (!this.isInitialized) {
+          await this.initialize();
+        }
+
+        await this.bot.sendMessage(
+          msg.chat.id,
+          "📧 Starting email processing..."
+        );
+        await emailProcessor.startEmailProcessing();
+      } else {
+        await this.bot.sendMessage(
+          msg.chat.id,
+          "📧 Email processing is already running"
+        );
+      }
+    } catch (error) {
+      logger.error("Error handling start processing command", {
+        error: error.message,
+      });
+      await this.sendErrorMessage(msg.chat.id);
+    }
+  }
+
+  // Update the existing handleStopProcessing method
+  async handleStopProcessing(msg) {
+    try {
+      if (msg.from.id.toString() !== config.telegram.userId) {
+        logger.warn(
+          `Unauthorized stop processing request from user ${msg.from.id}`
+        );
+        return;
+      }
+
+      const emailProcessor = require("../index");
+      if (emailProcessor.isProcessingEmails()) {
+        emailProcessor.stopEmailProcessing();
+        await this.bot.sendMessage(msg.chat.id, "📧 Email processing stopped");
+      } else {
+        await this.bot.sendMessage(
+          msg.chat.id,
+          "📧 Email processing is not running"
+        );
+      }
+    } catch (error) {
+      logger.error("Error handling stop processing command", {
+        error: error.message,
+      });
+      await this.sendErrorMessage(msg.chat.id);
     }
   }
 
@@ -78,21 +223,35 @@ class TelegramService {
       const helpMessage = `
 📧 *Gmail Agent Help*
 
-Commands:
-/summary \- Request an email summary
-/help \- Show this help message
+*Email Commands:*
+/start\\_processing \\- Start processing emails
+/stop\\_processing \\- Stop email processing
+/processing\\_status \\- Check processing status
+/summary \\- Request an email summary
+
+*Task Commands:*
+/tasks \\- View and manage tasks
+/task\\_done <task\\_id> \\- Mark a task as complete
 
 *Summary Types:*
-• Morning Overview \(9 AM\)
-• Midday Catch\-up \(2 PM\)
-• Evening Wrap\-up \(7 PM\)
+• Morning Overview \\(9 AM\\)
+• Midday Catch\\-up \\(2 PM\\)
+• Evening Wrap\\-up \\(7 PM\\)
 
-*Each Summary Includes:*
-• Overview of important emails
-• Top 5 priority items
-• Key insights
+*Task Management:*
+• Tasks are automatically extracted from emails
+• Tasks are prioritized as High/Medium/Low
+• Tasks can have deadlines and dependencies
+• Similar tasks are grouped automatically
+• Task completion notifications are sent to original emails
 
-*Note:* Summaries automatically run at scheduled times\. Use /summary for an immediate report\.`;
+*Email Processing:*
+1\\. System first analyzes all emails for tasks
+2\\. Auto\\-archives system notifications
+3\\. Waits for your command to start processing
+4\\. Processes remaining emails with your input
+
+*Note:* Use /help anytime to see this message\\.`;
 
       await this.bot.sendMessage(msg.chat.id, helpMessage, {
         parse_mode: "MarkdownV2",
@@ -108,21 +267,35 @@ Commands:
         const fallbackMessage = `
 📧 Gmail Agent Help
 
-Commands:
+Email Commands:
+/start_processing - Start processing emails
+/stop_processing - Stop email processing
+/processing_status - Check processing status
 /summary - Request an email summary
-/help - Show this help message
+
+Task Commands:
+/tasks - View and manage tasks
+/task_done <task_id> - Mark a task as complete
 
 Summary Types:
 • Morning Overview (9 AM)
 • Midday Catch-up (2 PM)
 • Evening Wrap-up (7 PM)
 
-Each Summary Includes:
-• Overview of important emails
-• Top 5 priority items
-• Key insights
+Task Management:
+• Tasks are automatically extracted from emails
+• Tasks are prioritized as High/Medium/Low
+• Tasks can have deadlines and dependencies
+• Similar tasks are grouped automatically
+• Task completion notifications are sent to original emails
 
-Note: Summaries automatically run at scheduled times. Use /summary for an immediate report.`;
+Email Processing:
+1. System first analyzes all emails for tasks
+2. Auto-archives system notifications
+3. Waits for your command to start processing
+4. Processes remaining emails with your input
+
+Note: Use /help anytime to see this message.`;
 
         await this.bot.sendMessage(msg.chat.id, fallbackMessage);
       } catch (fallbackError) {
@@ -145,6 +318,13 @@ Note: Summaries automatically run at scheduled times. Use /summary for an immedi
       }
 
       const action = callbackQuery.data;
+
+      // Handle task-related callbacks
+      if (action.startsWith("tasks_")) {
+        await this.handleTasksCallback(callbackQuery);
+        return;
+      }
+
       if (action.startsWith("summary_")) {
         const summaryType = action.split("_")[1];
         await this.bot.sendMessage(
@@ -184,6 +364,246 @@ Note: Summaries automatically run at scheduled times. Use /summary for an immedi
     }
   }
 
+  async handleTasksCallback(callbackQuery) {
+    try {
+      const action = callbackQuery.data;
+      const chatId = callbackQuery.message.chat.id;
+      let tasks = [];
+      let title = "";
+
+      switch (action) {
+        case "tasks_all":
+          tasks = await taskService.getTasks();
+          title = "All Tasks";
+          break;
+        case "tasks_due":
+          tasks = taskService.getDueTasks(7);
+          title = "Due Tasks (Next 7 Days)";
+          break;
+        case "tasks_high":
+          tasks = (await taskService.getTasks({ priority: "HIGH" })).filter(
+            (task) => task.status !== "COMPLETED"
+          );
+          title = "High Priority Tasks";
+          break;
+        case "tasks_medium":
+          tasks = (await taskService.getTasks({ priority: "MEDIUM" })).filter(
+            (task) => task.status !== "COMPLETED"
+          );
+          title = "Medium Priority Tasks";
+          break;
+        case "tasks_menu":
+          // Return to main tasks menu
+          await this.handleTasksCommand(callbackQuery.message);
+          await this.bot.answerCallbackQuery(callbackQuery.id);
+          return;
+        case "tasks_refresh":
+          // Re-fetch the current category
+          const currentTitle = callbackQuery.message.text.split("\n")[0];
+          await this.handleTasksCallback({
+            ...callbackQuery,
+            data: this.getActionFromTitle(currentTitle),
+          });
+          return;
+      }
+
+      if (!tasks || tasks.length === 0) {
+        await this.bot.sendMessage(
+          chatId,
+          `*${this.escapeSpecialChars(
+            title
+          )}*\n\n_No tasks found in this category\\._\n\nUse the buttons below to view other categories:`,
+          {
+            parse_mode: "MarkdownV2",
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: "📊 All Tasks", callback_data: "tasks_all" },
+                  { text: "⏰ Due Tasks", callback_data: "tasks_due" },
+                ],
+                [
+                  { text: "🔴 High Priority", callback_data: "tasks_high" },
+                  { text: "🟡 Medium Priority", callback_data: "tasks_medium" },
+                ],
+                [{ text: "◀️ Back to Menu", callback_data: "tasks_menu" }],
+              ],
+            },
+          }
+        );
+      } else {
+        await this.sendTaskList(chatId, tasks, title);
+      }
+
+      // Answer the callback query to remove loading state
+      await this.bot.answerCallbackQuery(callbackQuery.id);
+    } catch (error) {
+      logger.error("Error handling tasks callback", {
+        error: error.message,
+        action: callbackQuery.data,
+      });
+      await this.sendErrorMessage(callbackQuery.message.chat.id);
+      await this.bot.answerCallbackQuery(callbackQuery.id);
+    }
+  }
+
+  // Helper method to determine action from title
+  getActionFromTitle(title) {
+    const titleMap = {
+      "All Tasks": "tasks_all",
+      "Due Tasks": "tasks_due",
+      "High Priority Tasks": "tasks_high",
+      "Medium Priority Tasks": "tasks_medium",
+    };
+
+    for (const [key, value] of Object.entries(titleMap)) {
+      if (title.includes(key)) return value;
+    }
+    return "tasks_all"; // Default fallback
+  }
+
+  async sendTaskList(chatId, tasks, title) {
+    try {
+      const MAX_MESSAGE_LENGTH = 4000; // Leave some margin for Telegram's 4096 limit
+
+      if (tasks.length === 0) {
+        await this.bot.sendMessage(
+          chatId,
+          `*${this.escapeSpecialChars(title)}*\n\n_No tasks found\\._`,
+          {
+            parse_mode: "MarkdownV2",
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: "📊 All Tasks", callback_data: "tasks_all" },
+                  { text: "⏰ Due Tasks", callback_data: "tasks_due" },
+                ],
+                [
+                  { text: "🔴 High Priority", callback_data: "tasks_high" },
+                  { text: "🟡 Medium Priority", callback_data: "tasks_medium" },
+                ],
+                [{ text: "◀️ Back to Menu", callback_data: "tasks_menu" }],
+              ],
+            },
+          }
+        );
+        return;
+      }
+
+      // Send title first
+      let currentMessage = `*${this.escapeSpecialChars(title)}*\n\n`;
+      let taskCounter = 1;
+      let messageCounter = 1;
+
+      for (const task of tasks) {
+        // Format task entry
+        const safeDescription = this.escapeSpecialChars(task.description);
+        const safeId = this.escapeSpecialChars(task.id);
+        const priority = this.getPriorityEmoji(task.priority);
+        const deadline = task.deadline
+          ? ` \\(Due: ${this.escapeSpecialChars(task.deadline)}\\)`
+          : "";
+
+        const taskEntry = `${taskCounter}\\. ${priority} ID: \`${safeId}\`\n    ${safeDescription}${deadline}\n\n`;
+
+        // Check if adding this task would exceed the limit
+        if ((currentMessage + taskEntry).length > MAX_MESSAGE_LENGTH) {
+          // Send current message
+          await this.bot.sendMessage(chatId, currentMessage, {
+            parse_mode: "MarkdownV2",
+          });
+
+          // Start new message with title indicating continuation
+          currentMessage = `*${this.escapeSpecialChars(
+            title
+          )} \\(continued ${++messageCounter}\\)*\n\n`;
+        }
+
+        currentMessage += taskEntry;
+        taskCounter++;
+      }
+
+      // Add instructions to the last message
+      const instructions =
+        "\n_Use_ /task\\_done _followed by the task ID to mark it complete_";
+
+      // Check if adding instructions would exceed limit
+      if ((currentMessage + instructions).length > MAX_MESSAGE_LENGTH) {
+        // Send current message
+        await this.bot.sendMessage(chatId, currentMessage, {
+          parse_mode: "MarkdownV2",
+        });
+        currentMessage = instructions;
+      } else {
+        currentMessage += instructions;
+      }
+
+      // Send final message with enhanced navigation buttons
+      await this.bot.sendMessage(chatId, currentMessage, {
+        parse_mode: "MarkdownV2",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "🔄 Refresh List", callback_data: "tasks_refresh" },
+              { text: "⏰ Due Tasks", callback_data: "tasks_due" },
+            ],
+            [
+              { text: "🔴 High Priority", callback_data: "tasks_high" },
+              { text: "🟡 Medium Priority", callback_data: "tasks_medium" },
+            ],
+            [{ text: "◀️ Back to Menu", callback_data: "tasks_menu" }],
+          ],
+        },
+      });
+    } catch (error) {
+      logger.error("Error sending task list", {
+        error: error.message,
+        chatId,
+        taskCount: tasks?.length,
+      });
+
+      // Send a simplified fallback message
+      try {
+        await this.bot.sendMessage(
+          chatId,
+          `${title}\n\n${tasks.length} tasks found. The list is too long to display fully.\n\nUse the menu below to view different categories:`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: "📊 All Tasks", callback_data: "tasks_all" },
+                  { text: "⏰ Due Tasks", callback_data: "tasks_due" },
+                ],
+                [
+                  { text: "🔴 High Priority", callback_data: "tasks_high" },
+                  { text: "🟡 Medium Priority", callback_data: "tasks_medium" },
+                ],
+                [{ text: "◀️ Back to Menu", callback_data: "tasks_menu" }],
+              ],
+            },
+          }
+        );
+      } catch (fallbackError) {
+        logger.error("Error sending fallback task list", {
+          error: fallbackError.message,
+        });
+        await this.sendErrorMessage(chatId);
+      }
+    }
+  }
+
+  getPriorityEmoji(priority) {
+    switch (priority) {
+      case "HIGH":
+        return "🔴";
+      case "MEDIUM":
+        return "🟡";
+      case "LOW":
+        return "🟢";
+      default:
+        return "⚪️";
+    }
+  }
+
   async handleIncomingMessage(msg) {
     try {
       // Only process messages from authorized user
@@ -194,7 +614,12 @@ Note: Summaries automatically run at scheduled times. Use /summary for an immedi
 
       const confirmationData = this.pendingConfirmations.get(msg.from.id);
       if (!confirmationData) {
-        logger.warn(`No pending confirmation found for user ${msg.from.id}`);
+        return;
+      }
+
+      // Add task completion handling
+      if (confirmationData.type === "taskCompletion") {
+        await this.handleTaskCompletionResponse(msg, confirmationData);
         return;
       }
 
@@ -895,6 +1320,394 @@ Please provide your answer:`;
       await this.sendErrorMessage(userId);
     }
   }
+
+  async handleTasksCommand(msg) {
+    try {
+      const tasksByPriority = taskService.getTasksByPriority();
+      const dueTasks = taskService.getDueTasks(7);
+      const MAX_MESSAGE_LENGTH = 3000; // Reduced for safety
+      const MAX_TASKS_PER_SECTION = 5; // Limit tasks shown in overview
+
+      // Start with the header
+      let currentMessage = "📋 *Task Management*\n\n";
+
+      // Check if there are any tasks at all
+      const hasNoTasks =
+        tasksByPriority.HIGH.length === 0 &&
+        tasksByPriority.MEDIUM.length === 0 &&
+        tasksByPriority.LOW.length === 0 &&
+        dueTasks.length === 0;
+
+      if (hasNoTasks) {
+        currentMessage +=
+          "_No tasks found\\. Use the menu below to view different task categories\\._";
+      } else {
+        // Function to format task section with limits
+        const formatTaskSection = (tasks, title) => {
+          if (tasks.length === 0) return "";
+          let section = `*${title}:* \\(${tasks.length} total\\)\n`;
+          tasks.slice(0, MAX_TASKS_PER_SECTION).forEach((task, index) => {
+            const safeDescription = this.escapeSpecialChars(
+              task.description.length > 100
+                ? task.description.substring(0, 97) + "..."
+                : task.description
+            );
+            section += `${index + 1}\\. ${safeDescription}\n`;
+          });
+          if (tasks.length > MAX_TASKS_PER_SECTION) {
+            section += `_\\.\\.\\. and ${
+              tasks.length - MAX_TASKS_PER_SECTION
+            } more_\n`;
+          }
+          return section + "\n";
+        };
+
+        // Add sections with counts
+        if (tasksByPriority.HIGH.length > 0) {
+          currentMessage += formatTaskSection(
+            tasksByPriority.HIGH,
+            "🔴 High Priority Tasks"
+          );
+        }
+
+        if (tasksByPriority.MEDIUM.length > 0) {
+          currentMessage += formatTaskSection(
+            tasksByPriority.MEDIUM,
+            "🟡 Medium Priority Tasks"
+          );
+        }
+
+        if (dueTasks.length > 0) {
+          currentMessage += formatTaskSection(dueTasks, "⏰ Due This Week");
+        }
+      }
+
+      // Add help text
+      currentMessage +=
+        "\n_Use the buttons below to view complete task lists by category_";
+
+      // Send message with buttons
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: "📊 All Tasks", callback_data: "tasks_all" },
+            { text: "⏰ Due Tasks", callback_data: "tasks_due" },
+          ],
+          [
+            {
+              text: `🔴 High (${tasksByPriority.HIGH.length})`,
+              callback_data: "tasks_high",
+            },
+            {
+              text: `🟡 Medium (${tasksByPriority.MEDIUM.length})`,
+              callback_data: "tasks_medium",
+            },
+          ],
+        ],
+      };
+
+      await this.bot.sendMessage(msg.chat.id, currentMessage, {
+        parse_mode: "MarkdownV2",
+        reply_markup: keyboard,
+      });
+    } catch (error) {
+      logger.error("Error handling tasks command", {
+        error: error.message,
+        stack: error.stack,
+      });
+
+      // Send a simple fallback message
+      await this.bot.sendMessage(
+        msg.chat.id,
+        "📋 Task Management\n\nSelect a category to view tasks:",
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "📊 All Tasks", callback_data: "tasks_all" },
+                { text: "⏰ Due Tasks", callback_data: "tasks_due" },
+              ],
+              [
+                { text: "🔴 High Priority", callback_data: "tasks_high" },
+                { text: "🟡 Medium Priority", callback_data: "tasks_medium" },
+              ],
+            ],
+          },
+        }
+      );
+    }
+  }
+
+  async handleTaskDoneCommand(msg, match) {
+    try {
+      const taskId = match[1];
+      await this.bot.sendMessage(
+        msg.chat.id,
+        'Add completion notes (or send "skip" to skip):',
+        {
+          reply_markup: {
+            force_reply: true,
+          },
+        }
+      );
+
+      this.pendingConfirmations.set(msg.from.id, {
+        type: "taskCompletion",
+        taskId: taskId,
+      });
+    } catch (error) {
+      logger.error("Error handling task done command", {
+        error: error.message,
+      });
+      await this.sendErrorMessage(msg.chat.id);
+    }
+  }
+
+  async handleTaskCompletionResponse(msg, confirmationData) {
+    try {
+      const { taskId } = confirmationData;
+      const comment = msg.text.toLowerCase() === "skip" ? "" : msg.text;
+
+      await taskService.updateTaskStatus(taskId, "COMPLETED", comment);
+
+      await this.bot.sendMessage(
+        msg.chat.id,
+        "✅ Task marked as complete! Email notification has been sent.",
+        {
+          reply_markup: {
+            remove_keyboard: true,
+          },
+        }
+      );
+
+      this.pendingConfirmations.delete(msg.from.id);
+    } catch (error) {
+      logger.error("Error handling task completion response", {
+        error: error.message,
+        taskId: confirmationData?.taskId,
+      });
+      await this.sendErrorMessage(msg.chat.id);
+      this.pendingConfirmations.delete(msg.from.id);
+    }
+  }
+
+  async notifyNewTasks(email, tasks) {
+    try {
+      const MAX_MESSAGE_LENGTH = 4096;
+      let message = `📋 *New Tasks Extracted*\n\n`;
+      message += `From Email: ${this.escapeSpecialChars(email.subject)}\n\n`;
+
+      let currentMessage = message;
+
+      tasks.forEach((task, index) => {
+        const priority = this.getPriorityEmoji(task.priority);
+        const deadline = task.deadline
+          ? ` \\(Due: ${this.escapeSpecialChars(task.deadline)}\\)`
+          : "";
+
+        const taskLine = `${index + 1}\\. ${priority} ${this.escapeSpecialChars(
+          task.description
+        )}${deadline}\n`;
+
+        // Check if adding this task would exceed the limit
+        if ((currentMessage + taskLine).length > MAX_MESSAGE_LENGTH) {
+          // Send current message
+          this.bot.sendMessage(config.telegram.userId, currentMessage, {
+            parse_mode: "MarkdownV2",
+          });
+          // Start new message with header
+          currentMessage = message;
+        }
+
+        currentMessage += taskLine;
+      });
+
+      // Add final line
+      currentMessage += "\n_Use /tasks to view all tasks_";
+
+      // Send final message with button
+      await this.bot.sendMessage(config.telegram.userId, currentMessage, {
+        parse_mode: "MarkdownV2",
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📋 View Tasks", callback_data: "tasks_all" }],
+          ],
+        },
+      });
+    } catch (error) {
+      logger.error("Error notifying about new tasks", {
+        error: error.message,
+        emailId: email.id,
+        taskCount: tasks?.length,
+      });
+    }
+  }
+
+  async notifyTaskSummary(taskExtractionResults) {
+    try {
+      const MAX_MESSAGE_LENGTH = 4096; // Telegram's message length limit
+      let summaryMessage = `📋 *Task Summary*\n\n`;
+      let currentMessage = summaryMessage;
+
+      for (const { email, tasks } of taskExtractionResults) {
+        const emailSection =
+          `*From:* ${this.escapeSpecialChars(email.from)}\n` +
+          `*Subject:* ${this.escapeSpecialChars(email.subject)}\n\n`;
+
+        // Check if adding email section would exceed limit
+        if ((currentMessage + emailSection).length > MAX_MESSAGE_LENGTH) {
+          // Send current message and start new one
+          await this.bot.sendMessage(config.telegram.userId, currentMessage, {
+            parse_mode: "MarkdownV2",
+          });
+          currentMessage = summaryMessage; // Reset with header
+        }
+
+        currentMessage += emailSection;
+
+        for (const task of tasks) {
+          const taskSection = `• ${this.getPriorityEmoji(
+            task.priority
+          )} ${this.escapeSpecialChars(task.description)}\n`;
+
+          // Check if adding task would exceed limit
+          if ((currentMessage + taskSection).length > MAX_MESSAGE_LENGTH) {
+            // Send current message and start new one
+            await this.bot.sendMessage(config.telegram.userId, currentMessage, {
+              parse_mode: "MarkdownV2",
+            });
+            currentMessage = summaryMessage; // Reset with header
+          }
+
+          currentMessage += taskSection;
+        }
+
+        currentMessage += "\n"; // Add spacing between email sections
+      }
+
+      // Send any remaining message content
+      if (currentMessage !== summaryMessage) {
+        await this.bot.sendMessage(config.telegram.userId, currentMessage, {
+          parse_mode: "MarkdownV2",
+        });
+      }
+
+      // Send final message with action button
+      await this.bot.sendMessage(
+        config.telegram.userId,
+        "_Use /tasks to view all tasks_",
+        {
+          parse_mode: "MarkdownV2",
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "📋 View Tasks", callback_data: "tasks_all" }],
+            ],
+          },
+        }
+      );
+    } catch (error) {
+      logger.error("Error sending task summary notification", {
+        error: error.message,
+        taskGroupCount: taskExtractionResults?.length,
+      });
+    }
+  }
+
+  async handleStartProcessing(msg) {
+    try {
+      if (msg.from.id.toString() !== config.telegram.userId) {
+        logger.warn(
+          `Unauthorized start processing request from user ${msg.from.id}`
+        );
+        return;
+      }
+
+      const emailProcessor = require("../index");
+      if (!emailProcessor.isProcessingEmails()) {
+        // Reinitialize bot if needed
+        if (!this.isInitialized) {
+          await this.initialize();
+        }
+
+        await this.bot.sendMessage(
+          msg.chat.id,
+          "📧 Starting email processing..."
+        );
+        await emailProcessor.startEmailProcessing();
+      } else {
+        await this.bot.sendMessage(
+          msg.chat.id,
+          "📧 Email processing is already running"
+        );
+      }
+    } catch (error) {
+      logger.error("Error handling start processing command", {
+        error: error.message,
+      });
+      await this.sendErrorMessage(msg.chat.id);
+    }
+  }
+
+  async handleStopProcessing(msg) {
+    try {
+      if (msg.from.id.toString() !== config.telegram.userId) {
+        logger.warn(
+          `Unauthorized stop processing request from user ${msg.from.id}`
+        );
+        return;
+      }
+
+      const emailProcessor = require("../index");
+      if (emailProcessor.isProcessingEmails()) {
+        emailProcessor.stopEmailProcessing();
+        await this.bot.sendMessage(msg.chat.id, "📧 Email processing stopped");
+      } else {
+        await this.bot.sendMessage(
+          msg.chat.id,
+          "📧 Email processing is not running"
+        );
+      }
+    } catch (error) {
+      logger.error("Error handling stop processing command", {
+        error: error.message,
+      });
+      await this.sendErrorMessage(msg.chat.id);
+    }
+  }
+
+  async handleProcessingStatus(msg) {
+    try {
+      if (msg.from.id.toString() !== config.telegram.userId) {
+        logger.warn(`Unauthorized status request from user ${msg.from.id}`);
+        return;
+      }
+
+      const emailProcessor = require("../index");
+      const status = emailProcessor.isProcessingEmails()
+        ? "🟢 Email processing is running"
+        : "🔴 Email processing is stopped";
+
+      await this.bot.sendMessage(msg.chat.id, status);
+    } catch (error) {
+      logger.error("Error handling processing status command", {
+        error: error.message,
+      });
+      await this.sendErrorMessage(msg.chat.id);
+    }
+  }
 }
+
+// Add cleanup on process exit
+process.on("SIGINT", async () => {
+  const telegramService = require("./telegramService");
+  await telegramService.cleanup();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  const telegramService = require("./telegramService");
+  await telegramService.cleanup();
+  process.exit(0);
+});
 
 module.exports = new TelegramService();

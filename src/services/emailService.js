@@ -138,7 +138,7 @@ class EmailService {
       const response = await this.gmail.users.messages.list({
         userId: "me",
         q: "is:unread",
-        maxResults: 500,
+        maxResults: 10,
       });
 
       if (!response.data.messages) {

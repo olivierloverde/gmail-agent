@@ -2,14 +2,13 @@
 
 An intelligent email management system that automates email processing using AI. The system analyzes emails, suggests actions, and allows control through Telegram.
 
-# Demo 
+# Demo
 
 https://github.com/user-attachments/assets/a0b01e5f-2835-49d7-971d-f4c18abda5ee
 
 https://github.com/user-attachments/assets/2466c90a-c5fe-40fe-80c2-e5477a41ac5b
 
 https://github.com/user-attachments/assets/a5fb1641-c8da-4a26-93c8-9d14a74cbb6f
-
 
 ## Features 🌟
 
@@ -24,6 +23,8 @@ https://github.com/user-attachments/assets/a5fb1641-c8da-4a26-93c8-9d14a74cbb6f
 - **Multi-language Support**: Handles emails in any language
 - **Smart Threading**: Understands email conversation context
 - **Customizable Actions**: Archive, respond, or request more information
+- **Task Management**: Automatically extracts and manages tasks from emails
+- **Persistent Storage**: SQLite database for reliable task and email tracking
 
 ### Email Summaries
 
@@ -52,17 +53,30 @@ Each summary includes:
 - Brief overview of important communications
 - Top 5 priority emails ranked by urgency
 - Key insights and action items
+- Extracted tasks and their status
 
-Summaries automatically exclude:
+### Task Management
 
-- Automated notifications/alerts
-- Newsletters/marketing emails
-- System-generated messages
-- Calendar invites/updates
-- Subscription confirmations
-- Receipts/invoices
-- Social media notifications
-- Promotional offers
+The system automatically:
+
+- Extracts tasks from incoming emails
+- Groups similar tasks to avoid duplication
+- Assigns priorities (HIGH/MEDIUM/LOW) based on context
+- Creates parent tasks for related items
+- Tracks task status and progress
+- Provides task summaries via Telegram
+- Sends completion notifications to original email threads
+- Maintains task dependencies and relationships
+- Stores task history and updates in SQLite database
+
+Task Features:
+
+- Automatic priority assignment based on urgency and context
+- Smart task grouping using AI similarity detection
+- Parent-child task relationships for complex items
+- Task completion notifications sent to original senders
+- Task status tracking (PENDING/COMPLETED)
+- Task context preservation with email thread information
 
 ## Commands
 
@@ -70,7 +84,26 @@ Summaries automatically exclude:
   - Choose from morning, midday, evening, or quick summary types
   - Each type covers a specific time range
   - Summaries are focused on actionable items only
+- `/tasks`: View and manage tasks
+  - List all tasks
+  - Filter by status/priority
+  - Update task status
+  - View task details
+  - Mark tasks as complete with `/task_done <task_id>`
 - `/help`: Display available commands and information
+- `/start_processing`: Begin email processing
+- `/stop_processing`: Stop email processing
+- `/processing_status`: Check current processing status
+
+### Task Management Interface
+
+The bot provides interactive buttons for task management:
+
+- 🔄 Refresh List - Update task list
+- ⏰ Due Tasks - View upcoming deadlines
+- 🔴 High Priority - Filter high priority tasks
+- 🟡 Medium Priority - Filter medium priority tasks
+- ◀️ Back to Menu - Return to main menu
 
 ## Prerequisites 📋
 
@@ -78,6 +111,7 @@ Summaries automatically exclude:
 - Gmail Account with API access
 - Telegram Bot Token
 - OpenAI API Key
+- SQLite3
 
 ## Quick Start 🚀
 
